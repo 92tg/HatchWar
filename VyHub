@@ -11,6 +11,8 @@ C.petSpeed = C.petSpeed == true
 C.superMagnet = C.superMagnet == true
 C.efficientFarm = C.efficientFarm == true
 C.autoJoin = C.autoJoin ~= false
+C.whiteScreen = C.whiteScreen == true
+C.fpsCap = math.floor(math.clamp(tonumber(C.fpsCap) or 30, 1, 240))
 C.orb = false
 C.autoBoss = false
 C.orbTarget = nil
@@ -1185,7 +1187,6 @@ do
                         teleportToBoss(root)
                     end
 
-                    -- remote-only start: make sure the game really opened its circles, else use E
                     if useRemote and remoteAt and not remoteConfirmed then
                         if lastCircleAt >= startedAt then
                             remoteConfirmed = true
@@ -1233,7 +1234,6 @@ do
     end
 end
 
--- ======================= Witching Egg Auto Hatch =======================
 local WITCH = {
     Keyword = "Witching",
     ManualEggId = nil,
@@ -1376,7 +1376,6 @@ local function witchGetRemote()
     return r
 end
 
--- Learns the exact hatch call the game makes when you hatch the egg once by hand.
 local function installWitchLearn()
     if C._witchHooked then return end
     if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then return end
@@ -1419,7 +1418,6 @@ local function witchLearnedArgs(eggName)
     return a
 end
 
--- Typed amount wins (capped to your max hatch). 0 = use the game's own amount / your max.
 local function witchBuildArgs(eggName)
     local want = C.witchAmount
     local max = witchMaxHatch()
@@ -1493,7 +1491,6 @@ stopWitch = function()
     witchSetAnimations(false)
     witchSetStatus("Witching: idle")
 end
--- ======================================================================
 
 local function inst(cls, props, parent)
     local o = Instance.new(cls)
@@ -1562,6 +1559,68 @@ local function numRow(title, get, set)
         tb.Text = tostring(get())
     end)
     table.insert(sync, function() if not tb:IsFocused() then tb.Text = tostring(get()) end end)
+end
+
+local setWhiteScreen, setFpsCap
+do
+    local StarterGui = game:GetService("StarterGui")
+    local oldWs = gp:FindFirstChild("VY_White"); if oldWs then oldWs:Destroy() end
+    pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    local wsGui
+
+    local function gameSettings()
+        return UserSettings():GetService("UserGameSettings")
+    end
+
+    setWhiteScreen = function(on)
+        on = on == true
+        if on then
+            if not wsGui or not wsGui.Parent then
+                wsGui = inst("ScreenGui", { Name = "VY_White", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 50, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, gp)
+                inst("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, Active = false, Selectable = false }, wsGui)
+            end
+            if not C._wsSaved then
+                local saved = {}
+                pcall(function() saved.quality = settings().Rendering.QualityLevel end)
+                pcall(function() saved.volume = gameSettings().MasterVolume end)
+                pcall(function() saved.topbar = StarterGui:GetCore("TopbarEnabled") end)
+                if type(getfpscap) == "function" then pcall(function() saved.fps = getfpscap() end) end
+                C._wsSaved = saved
+            end
+            pcall(function() RunService:Set3dRenderingEnabled(false) end)
+            pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+            pcall(function() gameSettings().MasterVolume = 0 end)
+            pcall(function() StarterGui:SetCore("TopbarEnabled", false) end)
+            if type(setfpscap) == "function" then pcall(setfpscap, C.fpsCap) end
+        else
+            if wsGui then pcall(function() wsGui:Destroy() end); wsGui = nil end
+            local stray = gp:FindFirstChild("VY_White"); if stray then pcall(function() stray:Destroy() end) end
+            pcall(function() RunService:Set3dRenderingEnabled(true) end)
+            local saved = C._wsSaved
+            if saved then
+                if saved.quality ~= nil then pcall(function() settings().Rendering.QualityLevel = saved.quality end) end
+                if saved.volume ~= nil then pcall(function() gameSettings().MasterVolume = saved.volume end) end
+                if saved.topbar ~= nil then pcall(function() StarterGui:SetCore("TopbarEnabled", saved.topbar) end) end
+                if type(setfpscap) == "function" then pcall(setfpscap, saved.fps or 0) end
+                C._wsSaved = nil
+            end
+        end
+        C.whiteScreen = on
+    end
+
+    setFpsCap = function(v)
+        v = tonumber(v)
+        if not v then return end
+        C.fpsCap = math.floor(math.clamp(v, 1, 240))
+        if C.whiteScreen and type(setfpscap) == "function" then pcall(setfpscap, C.fpsCap) end
+    end
+
+    table.insert(C._efConns, UIS.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.L then setWhiteScreen(not C.whiteScreen) end
+    end))
+
+    if C.whiteScreen then setWhiteScreen(true) end
 end
 
 toggle("Orb Collector (hoverboard)", function() return C.orb end, function(v)
@@ -1649,6 +1708,8 @@ toggle("Super Magnet", function() return C.superMagnet end, function(v)
 end)
 
 toggle("Anti AFK", function() return C.antiAfk end, function(v) C.antiAfk = v end)
+toggle("White Screen (CPU saver)", function() return C.whiteScreen end, function(v) setWhiteScreen(v) end)
+numRow("FPS Cap (1-240)", function() return C.fpsCap end, setFpsCap)
 
 do
     local HttpService = game:GetService("HttpService")
@@ -1678,6 +1739,8 @@ do
                 antiAfk = C.antiAfk ~= false,
                 witchHatch = C.witchHatch == true,
                 witchAmount = C.witchAmount,
+                whiteScreen = C.whiteScreen == true,
+                fpsCap = C.fpsCap,
             }))
         end))
     end
@@ -1699,6 +1762,8 @@ do
         if type(cfg.petSpeed) == "boolean" then C.petSpeed = cfg.petSpeed end
         if type(cfg.superMagnet) == "boolean" then C.superMagnet = cfg.superMagnet end
         if type(cfg.antiAfk) == "boolean" then C.antiAfk = cfg.antiAfk end
+        if tonumber(cfg.fpsCap) then setFpsCap(cfg.fpsCap) end
+        if type(cfg.whiteScreen) == "boolean" and cfg.whiteScreen ~= C.whiteScreen then setWhiteScreen(cfg.whiteScreen) end
         local witchAmt = tonumber(cfg.witchAmount)
         if witchAmt and witchAmt >= 0 then C.witchAmount = math.floor(witchAmt) end
         if cfg.witchHatch == true then
