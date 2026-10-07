@@ -1847,6 +1847,3 @@ end)
 
 log("VY loaded.")
 return true
-
--- Anti AFK
-loadstring(game:HttpGet("https://gist.githubusercontent.com/pedromurilo0501-star/812d6bd62ffc0020545e0907e3f89741/raw/fcc346762f6abc95e341037ecd9f2d66374757a4/gistfile1.txt"))()
