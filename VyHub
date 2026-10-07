@@ -1,3 +1,301 @@
+task.spawn(function()
+	local CONFIG = {
+		Title = "Anti-AFK",
+		FallbackInterval = 240,
+		StopOnClose = false,
+	}
+
+	repeat task.wait() until game:IsLoaded()
+
+	local Players = game:GetService("Players")
+	local RunService = game:GetService("RunService")
+	local UserInputService = game:GetService("UserInputService")
+	local TweenService = game:GetService("TweenService")
+	local Stats = game:GetService("Stats")
+	local VirtualUser = game:GetService("VirtualUser")
+	local CoreGui = game:GetService("CoreGui")
+
+	repeat task.wait() until Players.LocalPlayer
+	local LocalPlayer = Players.LocalPlayer
+
+	local env = (getgenv and getgenv()) or _G
+
+	if type(env.VyAntiAfk) == "table" and env.VyAntiAfk.Destroy then
+		pcall(env.VyAntiAfk.Destroy)
+	end
+
+	local state = { running = true, pulses = 0 }
+	env.VyAntiAfk = state
+
+	local connections = {}
+	local function track(conn)
+		connections[#connections + 1] = conn
+		return conn
+	end
+
+	local lastPulse = os.clock()
+
+	local function pulse()
+		lastPulse = os.clock()
+		state.pulses = state.pulses + 1
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new(0, 0))
+		end)
+	end
+
+	local function nudge()
+		pcall(function()
+			local vim = game:GetService("VirtualInputManager")
+			vim:SendKeyEvent(true, Enum.KeyCode.F13, false, game)
+			task.wait(0.05)
+			vim:SendKeyEvent(false, Enum.KeyCode.F13, false, game)
+		end)
+	end
+
+	if getconnections then
+		pcall(function()
+			for _, c in ipairs(getconnections(LocalPlayer.Idled)) do
+				if c.Disable then
+					c:Disable()
+				elseif c.Disconnect then
+					c:Disconnect()
+				end
+			end
+		end)
+	end
+
+	track(LocalPlayer.Idled:Connect(function()
+		pulse()
+	end))
+
+	local function getGuiParent()
+		if gethui then
+			local ok, result = pcall(gethui)
+			if ok and result then
+				return result
+			end
+		end
+		return CoreGui
+	end
+
+	local function create(class, props, parent)
+		local inst = Instance.new(class)
+		for k, v in pairs(props) do
+			inst[k] = v
+		end
+		inst.Parent = parent
+		return inst
+	end
+
+	local WHITE = Color3.fromRGB(255, 255, 255)
+	local GREEN = Color3.fromRGB(90, 220, 120)
+
+	local gui = create("ScreenGui", {
+		Name = "VyAntiAfkGui",
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+	pcall(function()
+		if syn and syn.protect_gui then
+			syn.protect_gui(gui)
+		end
+	end)
+	gui.Parent = getGuiParent()
+
+	local main = create("Frame", {
+		Name = "Main",
+		BackgroundColor3 = Color3.fromRGB(30, 30, 30),
+		BorderSizePixel = 0,
+		Position = UDim2.new(0.085, 0, 0.13, 0),
+		Size = UDim2.new(0, 225, 0, 96),
+	}, gui)
+	create("UICorner", { CornerRadius = UDim.new(0, 8) }, main)
+
+	local function makeLabel(props)
+		props.BackgroundTransparency = 1
+		props.Font = props.Font or Enum.Font.SourceSans
+		props.TextColor3 = props.TextColor3 or WHITE
+		props.TextSize = props.TextSize or 14
+		props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+		return create("TextLabel", props, main)
+	end
+
+	makeLabel({
+		Name = "Title",
+		Text = CONFIG.Title,
+		Font = Enum.Font.SourceSansBold,
+		Position = UDim2.new(0, 10, 0, 3),
+		Size = UDim2.new(0, 170, 0, 20),
+	})
+
+	local closeBtn = create("TextButton", {
+		Name = "Close",
+		BackgroundTransparency = 1,
+		Font = Enum.Font.SourceSansBold,
+		Text = "X",
+		TextColor3 = WHITE,
+		TextSize = 14,
+		Position = UDim2.new(1, -30, 0, 3),
+		Size = UDim2.new(0, 26, 0, 20),
+	}, main)
+
+	local divider = create("Frame", {
+		Name = "Divider",
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 6, 0, 25),
+		Size = UDim2.new(1, -12, 0, 2),
+	}, main)
+	create("UICorner", { CornerRadius = UDim.new(0, 50) }, divider)
+
+	local pingLabel = makeLabel({
+		Name = "Ping",
+		Text = "Ping: --",
+		Position = UDim2.new(0, 10, 0, 32),
+		Size = UDim2.new(0, 100, 0, 20),
+	})
+
+	local fpsLabel = makeLabel({
+		Name = "Fps",
+		Text = "FPS: --",
+		Position = UDim2.new(0, 115, 0, 32),
+		Size = UDim2.new(0, 100, 0, 20),
+	})
+
+	local statusLabel = makeLabel({
+		Name = "Status",
+		Text = "Anti-AFK: Active (pulses: 0)",
+		TextColor3 = GREEN,
+		Position = UDim2.new(0, 10, 0, 54),
+		Size = UDim2.new(1, -20, 0, 18),
+	})
+
+	local timerLabel = makeLabel({
+		Name = "Timer",
+		Text = "Uptime: 00:00:00",
+		Position = UDim2.new(0, 10, 0, 72),
+		Size = UDim2.new(1, -20, 0, 18),
+	})
+
+	local dragging, dragInput, dragStart, startPos
+
+	local function updateDrag(input)
+		local delta = input.Position - dragStart
+		local goal = {
+			Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			),
+		}
+		TweenService:Create(main, TweenInfo.new(0.04, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), goal):Play()
+	end
+
+	track(main.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+			local c
+			c = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					c:Disconnect()
+				end
+			end)
+		end
+	end))
+
+	track(main.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end))
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			updateDrag(input)
+		end
+	end))
+
+	function state.Destroy()
+		state.running = false
+		for _, c in ipairs(connections) do
+			pcall(function() c:Disconnect() end)
+		end
+		connections = {}
+		pcall(function() gui:Destroy() end)
+		if env.VyAntiAfk == state then
+			env.VyAntiAfk = nil
+		end
+	end
+
+	track(closeBtn.MouseButton1Click:Connect(function()
+		if CONFIG.StopOnClose then
+			state.Destroy()
+		else
+			pcall(function() gui:Destroy() end)
+		end
+	end))
+
+	local function getPing()
+		local ok, value = pcall(function()
+			return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+		end)
+		if ok and type(value) == "number" then
+			return value
+		end
+		ok, value = pcall(function()
+			return LocalPlayer:GetNetworkPing() * 1000
+		end)
+		if ok and type(value) == "number" then
+			return value
+		end
+		return nil
+	end
+
+	local function formatTime(total)
+		return string.format("%02d:%02d:%02d", math.floor(total / 3600), math.floor(total / 60) % 60, total % 60)
+	end
+
+	local frames = 0
+	local lastFpsTick = os.clock()
+	local startTime = os.time()
+
+	track(RunService.RenderStepped:Connect(function()
+		frames = frames + 1
+	end))
+
+	task.spawn(function()
+		while state.running do
+			task.wait(1)
+			if not state.running then
+				break
+			end
+
+			pcall(function()
+				local now = os.clock()
+				local fps = math.floor(frames / math.max(now - lastFpsTick, 0.001) + 0.5)
+				frames = 0
+				lastFpsTick = now
+
+				if now - lastPulse >= CONFIG.FallbackInterval then
+					pulse()
+					nudge()
+				end
+
+				if gui.Parent then
+					local ping = getPing()
+					pingLabel.Text = ping and ("Ping: " .. math.floor(ping + 0.5) .. " ms") or "Ping: n/a"
+					fpsLabel.Text = "FPS: " .. fps
+					statusLabel.Text = "Anti-AFK: Active (pulses: " .. state.pulses .. ")"
+					timerLabel.Text = "Uptime: " .. formatTime(os.time() - startTime)
+				end
+			end)
+		end
+	end)
+end)
+
 if not game:IsLoaded() then game.Loaded:Wait() end
 
 getgenv().LimonOrb = getgenv().LimonOrb or {}
