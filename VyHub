@@ -314,10 +314,13 @@ C.fpsCap = math.floor(math.clamp(tonumber(C.fpsCap) or 30, 1, 240))
 C.orb = false
 C.autoBoss = false
 C.orbTarget = nil
-C.witchHatch = false
-C.witchAmount = math.max(0, math.floor(tonumber(C.witchAmount) or 0))
+C.bossClickDelay = math.clamp(tonumber(C.bossClickDelay) or 0.1, 0, 3)
+C.manorHatch = false
+C.manorAmount = math.max(0, math.floor(tonumber(C.manorAmount) or 0))
+C.autoKnock = C.autoKnock == true
+C.autoBuyHouses = C.autoBuyHouses == true
 C.orbZone = math.floor(tonumber(C.orbZone) or 1)
-if C.orbZone < 1 or C.orbZone > 4 then C.orbZone = 1 end
+if C.orbZone < 1 or C.orbZone > 6 then C.orbZone = 1 end
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -338,6 +341,8 @@ end
 C._efConns = {}
 local function alive() return MY_RUN == C._runId end
 local function log(...) if C.verb then print("[VY]", ...) end end
+local doorsHoldUntil = 0 -- door teleport settle window, pauses the Orb / Boss / Manor movers
+local function doorsHolding() return os.clock() < doorsHoldUntil end
 
 C.antiAfk = C.antiAfk ~= false
 if C._afkConn then pcall(function() C._afkConn:Disconnect() end) end
@@ -622,6 +627,8 @@ local ORB_ZONES = {
     [2] = "2 | Spore Forest",
     [3] = "3 | Green Graveyard",
     [4] = "4 | Witching Hour",
+    [5] = "5 | Werewolf Woods",
+    [6] = "6 | Count's Manor",
 }
 local HW_MOVE_TIMEOUT = 8
 local HW_BLACKLIST_TIME = 15
@@ -735,7 +742,7 @@ local function getZoneInfo(number)
     local now = os.clock()
     local info = zoneInfoCache[number]
     if info then
-        if info.bounds and now - info.at < 30 then return info end
+        if info.bounds and now - info.at < 300 then return info end
         if not info.bounds and now - info.at < 1 then return info end
     end
 
@@ -787,7 +794,7 @@ local function orbOwnerZone(key, pos)
     if cached and cached.pos == pos and (cached.complete or now - cached.at < 5) then return cached.zone end
 
     local candidates, complete = {}, true
-    for number = 1, 4 do
+    for number = 1, #ORB_ZONES do
         local info = getZoneInfo(number)
         if info.bounds then
             if inOrbBounds(pos, info.bounds) then candidates[#candidates + 1] = number end
@@ -864,6 +871,7 @@ local function installHoverboardSteering()
 
     pcall(function() if setreadonly then setreadonly(class, false) end end)
     local hook = function(self, ...)
+        if self._isLocal and doorsHolding() then return Vector3.zero end
         local target = C.orbTarget
         if target and C.orb and alive() and self._isLocal then
             local root = self._humanoidRootPart
@@ -1045,7 +1053,7 @@ local function collectNextOrb(myRun)
     local doing = retrying and "retrying a skipped orb" or "collecting"
     if not inOrbBounds(rootPos, bounds) then doing = "riding to the zone, " .. doing end
     setStatus(("zone %d | %s (%d in zone, %d total)"):format(orbZoneNumber, doing, inZone, total))
-    if C._orbRun == myRun then C.orbTarget = nearest.Position end
+    if C._orbRun == myRun and not doorsHolding() then C.orbTarget = nearest.Position end
     task.wait(0.05)
 end
 
@@ -1059,6 +1067,12 @@ local function orbWorker(myRun)
         restoreIdentity()
 
         local ok, err = pcall(function()
+            if doorsHolding() then
+                clearChase()
+                task.wait(0.1)
+                return
+            end
+
             if orbZoneNumber ~= C.orbZone then
                 orbZoneNumber = C.orbZone
                 orbBlacklist = {}
@@ -1127,11 +1141,14 @@ end
 
 local startBoss, stopBoss
 local bossLabel
+local trickActiveUntil = 0
+local function trickTapping() return os.clock() < trickActiveUntil end
 
 do
-    local BOSS_PATH = { "INTERACT", "Bosses", "Boss4", "BossRig" }
+    local BOSS_ZONE = 6
+    local BOSS_PATH = { "INTERACT", "Bosses", "Boss" .. BOSS_ZONE, "BossRig" }
     local BOSS_OFFSET = Vector3.new(0, 3, 0)
-    local BOSS_FALLBACK = Vector3.new(6950, 16, 21980)
+    local BOSS_FALLBACK = Vector3.new(7626.6, 16, 21980.4)
     local TELEPORT_EVERY = 2
     local START_EVERY = 2
     local FIGHT_IDLE = 6
@@ -1142,7 +1159,7 @@ do
 
     local CIRCLE_NAME = "LiveCircle"
     local METHOD = "auto"
-    local REACTION_DELAY = { 0.04, 0.12 }
+    local CLICK_JITTER = 0.02
     local RETRY_AFTER = 0.15
     local MAX_TRIES = 6
     local MAX_TAPS_PER_SEC = 8
@@ -1155,7 +1172,10 @@ do
     local HAS_SIGNAL = type(firesignal) == "function" or type(getconnections) == "function"
     local bossState = "idle"
 
-    local function rand(a, b) return a + math.random() * (b - a) end
+    local function clickDelay()
+        local d = math.clamp(tonumber(C.bossClickDelay) or 0.1, 0, 3)
+        return d + math.random() * CLICK_JITTER
+    end
 
     local function setBossState(text)
         if text ~= bossState then
@@ -1185,7 +1205,8 @@ do
                 rate = math.min(rate, cap * 0.8)
             end
         end
-        return 1 / math.max(rate, 1)
+        local delay = math.clamp(tonumber(C.bossClickDelay) or 0.1, 0, 3)
+        return math.max(1 / math.max(rate, 1), delay)
     end
 
     local function track(obj)
@@ -1194,7 +1215,7 @@ do
         lastCircleAt = now
         circles[obj] = {
             born = now,
-            ready = now + rand(REACTION_DELAY[1], REACTION_DELAY[2]),
+            ready = now + clickDelay(),
             last = -math.huge,
             tries = 0,
         }
@@ -1211,7 +1232,7 @@ do
     local playerGui = lp:FindFirstChild("PlayerGui")
     if playerGui then
         table.insert(C._efConns, playerGui.DescendantAdded:Connect(function(d)
-            if C.autoBoss and d.Name == CIRCLE_NAME then track(d) end
+            if (C.autoBoss or trickTapping()) and d.Name == CIRCLE_NAME then track(d) end
         end))
     end
 
@@ -1366,7 +1387,7 @@ do
     task.spawn(function()
         local lastTap = -math.huge
         while alive() do
-            if not (C.running and C.autoBoss) then
+            if not (C.running and (C.autoBoss or trickTapping())) then
                 task.wait(0.2)
             else
                 task.wait()
@@ -1424,10 +1445,10 @@ do
                 starting, startedAt = true, now
                 task.spawn(function()
                     local ok, a, b = pcall(function()
-                        return remote:InvokeServer("HatchWar", "HW_Boss_Start", 4)
+                        return remote:InvokeServer("HatchWar", "HW_Boss_Start", BOSS_ZONE)
                     end)
                     starting = false
-                    if ok and a ~= false then
+                    if ok and a then
                         graceUntil, remoteAt, lastReason = os.clock() + START_GRACE, os.clock(), nil
                         log("Boss: fight started (remote)")
                     else
@@ -1480,7 +1501,7 @@ do
 
                     local now = os.clock()
 
-                    if now - lastTeleport >= TELEPORT_EVERY then
+                    if now - lastTeleport >= TELEPORT_EVERY and not doorsHolding() then
                         lastTeleport = now
                         teleportToBoss(root)
                     end
@@ -1496,7 +1517,7 @@ do
 
                     if fightActive(now) then
                         setBossState("fighting")
-                    elseif now - lastStart >= START_EVERY then
+                    elseif now - lastStart >= START_EVERY and not doorsHolding() then
                         lastStart = now
                         setBossState("starting fight")
                         if not GuiService.MenuIsOpen then startFight() end
@@ -1512,6 +1533,8 @@ do
             if bossLabel then
                 if C.autoBoss then
                     bossLabel.Text = ("Boss: %s | hit %d | lost %d | taps %d"):format(bossState, stats.hit, stats.lost, stats.taps)
+                elseif trickTapping() then
+                    bossLabel.Text = ("Boss: tapping Trick fight circles | hit %d | taps %d"):format(stats.hit, stats.taps)
                 else
                     bossLabel.Text = "Boss: idle"
                 end
@@ -1529,27 +1552,58 @@ do
 
     stopBoss = function()
         table.clear(circles)
+        if trickTapping() then scanCircles() end
     end
 end
 
-local WITCH = {
-    Keyword = "Witching",
-    ManualEggId = nil,
+local MANOR = {
+    EggId = "Manor Egg",
+    EggModule = "6 | Manor Egg",
+    TeleportTo = Vector3.new(7538.07666015625, 16.2394962310791, 21966.4765625),
+    MaxDistance = 35,
+    CloseDistance = 10,
+    TeleportEvery = 2,
     Delay = 0.15,
     DisableAnimations = true,
     HideEggModel = true,
 }
 
-local witchLabel
-local witchRemote, witchEgg
-local witchScanAt, witchHatched = 0, 0
-C._witchHidden = C._witchHidden or {}
-
-local function witchSetStatus(text)
-    if witchLabel then pcall(function() witchLabel.Text = text end) end
+local manorLabel
+local manorRemote, manorDir, manorCmds
+local manorHatched = 0
+C._manorHidden = C._manorHidden or {}
+if type(C._witchHidden) == "table" then
+    for model, saved in pairs(C._witchHidden) do C._manorHidden[model] = saved end
+    C._witchHidden = nil
+end
+if C._eggAnimOrig == nil and C._witchOrigAnim ~= nil then
+    C._eggAnimOrig = C._witchOrigAnim
+    C._witchOrigAnim = nil
 end
 
-local function witchSetAnimations(disable)
+local function withIdentity(level, fn, ...)
+    setIdentity(level)
+    local results = table.pack(pcall(fn, ...))
+    restoreIdentity()
+    return table.unpack(results, 1, results.n)
+end
+
+local function fmtNum(n)
+    n = tonumber(n)
+    if not n then return "?" end
+    local abs = math.abs(n)
+    if abs >= 1e12 then return ("%.2fT"):format(n / 1e12) end
+    if abs >= 1e9 then return ("%.2fB"):format(n / 1e9) end
+    if abs >= 1e6 then return ("%.2fM"):format(n / 1e6) end
+    if abs >= 1e3 then return ("%.1fK"):format(n / 1e3) end
+    return tostring(math.floor(n))
+end
+
+local function manorSetStatus(text)
+    if manorLabel then pcall(function() manorLabel.Text = text end) end
+end
+
+local function manorSetAnimations(disable)
     task.spawn(function()
         local ok, err = pcall(function()
             if type(getsenv) ~= "function" then error("getsenv not supported by this executor") end
@@ -1562,76 +1616,117 @@ local function witchSetAnimations(disable)
                 error("PlayEggAnimation not found in script environment")
             end
             if disable then
-                if C._witchOrigAnim == nil then C._witchOrigAnim = senv.PlayEggAnimation end
+                if C._eggAnimOrig == nil then C._eggAnimOrig = senv.PlayEggAnimation end
                 senv.PlayEggAnimation = function() return end
-            elseif C._witchOrigAnim ~= nil then
-                senv.PlayEggAnimation = C._witchOrigAnim
-                C._witchOrigAnim = nil
+            elseif C._eggAnimOrig ~= nil then
+                senv.PlayEggAnimation = C._eggAnimOrig
+                C._eggAnimOrig = nil
             end
         end)
         if ok then
-            log("Witching: egg animations " .. (disable and "disabled" or "restored"))
+            log("Manor: egg + pet hatch animations " .. (disable and "disabled" or "restored"))
         else
-            log("Witching: could not change animations:", err)
+            log("Manor: could not change animations:", err)
         end
     end)
 end
 
-local function witchEggFolder()
-    local things = workspace:FindFirstChild("__THINGS")
-    return things and things:FindFirstChild("CustomEggs")
+local function manorEggCmds()
+    if manorCmds then return manorCmds end
+    local ok, mod = withIdentity(2, function()
+        local m = clientModule("CustomEggsCmds", 10)
+        return m and require(m)
+    end)
+    if ok and type(mod) == "table" and type(mod.All) == "function" then manorCmds = mod end
+    return manorCmds
 end
 
-local function witchLooksLike(egg)
-    local kw = WITCH.Keyword:lower()
-    for _, value in pairs(egg:GetAttributes()) do
-        if tostring(value):lower():find(kw, 1, true) then return true end
-    end
-    for _, d in ipairs(egg:GetDescendants()) do
-        if d.Name:lower():find(kw, 1, true) then return true end
-        if d:IsA("TextLabel") and d.Text:lower():find(kw, 1, true) then return true end
-        if d:IsA("StringValue") and d.Value:lower():find(kw, 1, true) then return true end
-    end
-    return false
+local function manorEggDir(egg)
+    if egg and type(egg._dir) == "table" then return egg._dir end
+    if manorDir then return manorDir end
+    local ok, dir = withIdentity(2, function() return require(RS.Library.Directory).Eggs[MANOR.EggId] end)
+    if ok and type(dir) == "table" then manorDir = dir end
+    return manorDir
 end
 
-local function witchFindEgg()
-    local folder = witchEggFolder()
-    if not folder then return nil end
-
-    if WITCH.ManualEggId then return folder:FindFirstChild(WITCH.ManualEggId) end
-    if witchEgg and witchEgg.Parent == folder then return witchEgg end
-    witchEgg = nil
-
-    local now = os.clock()
-    if now - witchScanAt >= 2 then
-        witchScanAt = now
-        for _, egg in ipairs(folder:GetChildren()) do
-            if witchLooksLike(egg) then
-                witchEgg = egg
-                return egg
-            end
-        end
-    end
+local function manorFindEgg()
+    local cmds = manorEggCmds()
+    if not cmds then return nil, "module" end
+    local okAll, all = pcall(cmds.All)
+    if not (okAll and type(all) == "table") then return nil, "module" end
 
     local char = lp.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-    local best, bestDist
-    for _, egg in ipairs(folder:GetChildren()) do
-        if egg:IsA("PVInstance") then
-            local dist = (egg:GetPivot().Position - root.Position).Magnitude
-            if not bestDist or dist < bestDist then best, bestDist = egg, dist end
+    local here = root and root.Position or MANOR.TeleportTo
+    local best, bestDist, locked, hidden = nil, nil, 0, 0
+    for _, egg in pairs(all) do
+        if type(egg) == "table" and egg._id == MANOR.EggId and not egg._destroyed then
+            if egg._renderable == false then
+                hidden += 1
+            elseif egg._hatchable == false then
+                locked += 1
+            else
+                local pos = typeof(egg._position) == "Vector3" and egg._position or nil
+                if not pos and typeof(egg._model) == "Instance" and egg._model.Parent then
+                    pos = egg._model:GetPivot().Position
+                end
+                local dist = pos and (pos - here).Magnitude or math.huge
+                if not best or dist < bestDist then best, bestDist = egg, dist end
+            end
         end
     end
-    return best
+    if best then return best, bestDist end
+    return nil, (locked > 0 and "locked") or (hidden > 0 and "hidden") or "missing"
 end
 
-local function witchHideEgg(egg)
-    if C._witchHidden[egg] then return end
-    local saved = {}
-    C._witchHidden[egg] = saved
-    for _, d in ipairs(egg:GetDescendants()) do
+local function manorPrice(egg)
+    local dir = manorEggDir(egg)
+    if dir then
+        local ignoreCharged = not (egg and egg._allowChargedAndGolden == true)
+        local ok, price = withIdentity(2, function()
+            return require(RS.Library.Balancing.CalcEggPricePlayer)(dir, nil, ignoreCharged)
+        end)
+        if ok and type(price) == "number" and price > 0 then return price end
+        ok, price = withIdentity(2, function() return require(RS.Library.Balancing.CalcEggPrice)(dir) end)
+        if ok and type(price) == "number" and price > 0 then return price end
+        if type(dir.overrideCost) == "number" and dir.overrideCost > 0 then return dir.overrideCost end
+    end
+    return 4802000
+end
+
+local function manorCoins(egg)
+    local dir = manorEggDir(egg)
+    local currency = dir and dir.currency or "HatchWarCoins"
+    local ok, n = withIdentity(2, function() return require(RS.Library.Client.CurrencyCmds).Get(currency) end)
+    if ok and type(n) == "number" then return n end
+    return nil
+end
+
+local function manorMaxHatch(egg)
+    if egg and type(egg._maxEggCount) == "number" and egg._maxEggCount > 0 then
+        return math.floor(egg._maxEggCount)
+    end
+    local dir = manorEggDir(egg)
+    local ok, n = withIdentity(2, function() return require(RS.Library.Client.EggCmds).GetMaxHatch(dir) end)
+    if ok and type(n) == "number" and n > 0 then return math.floor(n) end
+    return nil
+end
+
+local function manorAmount(egg)
+    local max = manorMaxHatch(egg)
+    local price = manorPrice(egg)
+    local coins = manorCoins(egg)
+    local amount = max or 1
+    if coins then amount = math.min(amount, math.floor(coins / price)) end
+    if C.manorAmount > 0 then amount = math.min(amount, C.manorAmount) end
+    return math.max(0, math.floor(amount)), max, price, coins
+end
+
+local function manorHideEgg(model)
+    if typeof(model) ~= "Instance" or C._manorHidden[model] then return end
+    local saved = { items = {} }
+    C._manorHidden[model] = saved
+    local function hide(d)
         local prop, off
         if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
             prop, off = "Transparency", 1
@@ -1642,153 +1737,537 @@ local function witchHideEgg(egg)
         if prop then
             local okG, cur = pcall(function() return d[prop] end)
             if okG then
-                saved[#saved + 1] = { d, prop, cur }
+                saved.items[#saved.items + 1] = { d, prop, cur }
                 pcall(function() d[prop] = off end)
             end
         end
     end
+    for _, d in ipairs(model:GetDescendants()) do hide(d) end
+    saved.conn = model.DescendantAdded:Connect(function(d)
+        if C._manorHidden[model] == saved then task.defer(hide, d) end
+    end)
 end
 
-local function witchRestoreEggs()
-    for egg, saved in pairs(C._witchHidden) do
-        for _, s in ipairs(saved) do
+local function manorRestoreEggs()
+    for model, saved in pairs(C._manorHidden) do
+        if saved.conn then pcall(function() saved.conn:Disconnect() end) end
+        for _, s in ipairs(saved.items or saved) do
             pcall(function() s[1][s[2]] = s[3] end)
         end
-        C._witchHidden[egg] = nil
+        C._manorHidden[model] = nil
     end
 end
 
-local function witchGetRemote()
-    if witchRemote and witchRemote.Parent then return witchRemote end
+local function manorGetRemote()
+    if manorRemote and manorRemote.Parent then return manorRemote end
     local net = RS:FindFirstChild("Network")
-    if not net then return nil end
-    local r = net:FindFirstChild("CustomEggs_Hatch")
-    if not r then
-        for _, v in ipairs(net:GetChildren()) do
-            local n = v.Name:lower()
-            if n:find("customegg", 1, true) and n:find("hatch", 1, true) then r = v; break end
-        end
-    end
-    witchRemote = r
-    C._witchRemote = r
-    return r
+    manorRemote = net and net:FindFirstChild("CustomEggs_Hatch") or nil
+    return manorRemote
 end
 
-local function installWitchLearn()
-    if C._witchHooked then return end
-    if type(hookmetamethod) ~= "function" or type(getnamecallmethod) ~= "function" then return end
-    local ok = pcall(function()
-        local wrap = newcclosure or function(f) return f end
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            local method = getnamecallmethod()
-            if (method == "InvokeServer" or method == "FireServer")
-                and self == C._witchRemote
-                and not (checkcaller and checkcaller()) then
-                local packed = table.pack(...)
-                if type(packed[1]) == "string" then
-                    packed.id = packed[1]
-                    C._witchLearned = packed
-                    task.defer(log, "Witching: calibrated from your manual hatch, amount =", packed[2])
+local function manorHatch(egg, amount)
+    local remote = manorGetRemote()
+    if not remote then return false, "hatch remote not found" end
+    local ok, a, b = pcall(function()
+        if remote:IsA("RemoteFunction") then return remote:InvokeServer(egg._uid, amount) end
+        remote:FireServer(egg._uid, amount)
+        return true
+    end)
+    if not ok then return false, tostring(a) end
+    if not a then return false, type(b) == "string" and b or "refused" end
+    return true
+end
+
+local function manorTeleport()
+    local char = lp.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (root and hum and hum.Health > 0) then return false end
+    local rotation = root.CFrame - root.CFrame.Position
+    root.CFrame = CFrame.new(MANOR.TeleportTo) * rotation
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return true
+end
+
+local function manorTeleportClose(eggPos)
+    local char = lp.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+    local flat = Vector3.new(MANOR.TeleportTo.X - eggPos.X, 0, MANOR.TeleportTo.Z - eggPos.Z)
+    local dir = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0, 0, 1)
+    local target = Vector3.new(eggPos.X, MANOR.TeleportTo.Y, eggPos.Z) + dir * MANOR.CloseDistance
+    local rotation = root.CFrame - root.CFrame.Position
+    root.CFrame = CFrame.new(target) * rotation
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return true
+end
+
+local function manorDebounce()
+    local ok, d = withIdentity(2, function() return require(RS.Library.Client.EggCmds).ComputeDebounce() end)
+    if ok and type(d) == "number" and d > 0 and d < 10 then return d + 0.05 end
+    return 1.7
+end
+
+local startManor, stopManor
+
+startManor = function()
+    C._manorRun = (C._manorRun or 0) + 1
+    local myRun = C._manorRun
+    manorHatched = 0
+    if MANOR.DisableAnimations then manorSetAnimations(true) end
+    manorSetStatus("Manor: starting...")
+
+    task.spawn(function()
+        local lastErr, lastTeleport, needTeleport, warnedMax = nil, -math.huge, true, false
+        local debounce = manorDebounce()
+        while alive() and C.manorHatch and C._manorRun == myRun do
+            local waitFor = MANOR.Delay
+            local ok, err = pcall(function()
+                if not getZoneRoot() then
+                    manorSetStatus("Manor: waiting for HatchWar...")
+                    waitFor = 1
+                    return
                 end
+
+                if needTeleport then
+                    manorSetStatus("Manor: teleporting to the egg...")
+                    if manorTeleport() then
+                        needTeleport = false
+                        lastTeleport = os.clock()
+                    end
+                    waitFor = 0.5
+                    return
+                end
+
+                local egg, info = manorFindEgg()
+                if not egg then
+                    if info == "module" then
+                        manorSetStatus("Manor: waiting for the egg module...")
+                    elseif info == "locked" then
+                        manorSetStatus("Manor: egg not hatchable yet (zone 6 locked?)")
+                    elseif info == "hidden" then
+                        manorSetStatus("Manor: egg not loaded yet - waiting...")
+                    else
+                        manorSetStatus("Manor: egg not found - waiting...")
+                    end
+                    waitFor = 1
+                    return
+                end
+
+                local char = lp.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then
+                    waitFor = 0.5
+                    return
+                end
+                local eggPos = typeof(egg._position) == "Vector3" and egg._position or MANOR.TeleportTo
+                if (eggPos - root.Position).Magnitude > MANOR.MaxDistance then
+                    if os.clock() - lastTeleport >= MANOR.TeleportEvery and not doorsHolding() then
+                        lastTeleport = os.clock()
+                        manorSetStatus("Manor: teleporting to the egg...")
+                        manorTeleport()
+                    end
+                    waitFor = 0.25
+                    return
+                end
+
+                if MANOR.HideEggModel then manorHideEgg(egg._model) end
+
+                local amount, max, price, coins = manorAmount(egg)
+                if max == nil and not warnedMax then
+                    warnedMax = true
+                    log("Manor: max hatch amount unknown (GetMaxHatch failed) - hatching x1 until it loads")
+                end
+                if amount < 1 then
+                    manorSetStatus(("Manor: not enough coins (%s, need %s per egg)"):format(fmtNum(coins or 0), fmtNum(price)))
+                    waitFor = 1
+                    return
+                end
+
+                local okH, why = manorHatch(egg, amount)
+                if C._manorRun ~= myRun then return end
+                if okH then
+                    lastErr = nil
+                    manorHatched += amount
+                    manorSetStatus(("Manor: x%d | hatched %d | max %s | %s coins"):format(amount, manorHatched, tostring(max or "?"), fmtNum(coins)))
+                    waitFor = math.max(MANOR.Delay, debounce)
+                else
+                    local msg = tostring(why):lower()
+                    if msg:find("too quickly", 1, true) or msg:find("too fast", 1, true) then
+                        manorSetStatus(("Manor: hatch cooldown... | hatched %d"):format(manorHatched))
+                        waitFor = 0.3
+                        return
+                    end
+                    manorSetStatus("Manor: hatch failed - " .. tostring(why))
+                    if why ~= lastErr then
+                        lastErr = why
+                        log("Manor: hatch failed -", why)
+                    end
+                    if msg:find("close", 1, true) or msg:find("near", 1, true)
+                        or msg:find("far", 1, true) or msg:find("distance", 1, true) then
+                        manorSetStatus("Manor: moving closer to the egg...")
+                        manorTeleportClose(eggPos)
+                    end
+                    waitFor = 1
+                end
+            end)
+            if not ok then
+                log("Manor error:", err)
+                waitFor = 1
             end
-            return oldNamecall(self, ...)
-        end))
+            task.wait(waitFor)
+        end
     end)
-    if ok then C._witchHooked = true end
 end
 
-local function witchMaxHatch()
-    local ok, n = pcall(function()
-        return require(RS.Library.Client.EggCmds).GetMaxHatch()
-    end)
-    if ok and type(n) == "number" and n > 0 then return n end
+stopManor = function()
+    C._manorRun = (C._manorRun or 0) + 1
+    manorRestoreEggs()
+    manorSetAnimations(false)
+    manorSetStatus("Manor: idle")
+end
+
+local DOORS = {
+    ZoneName = "6 | Count's Manor",
+    Houses = 8,
+    Tick = 1,
+    RetryAfter = 5,
+    BuyRetryAfter = 10,
+    StandBack = 4,
+    SettleTime = 0.4,
+}
+
+local doorsLabel
+local doorsUtilMod, doorsInstancing
+local doorsStats = { active = false, knocks = 0, prizes = 0, last = "", buy = "" }
+
+local function doorsSetStatus(text)
+    if doorsLabel then pcall(function() doorsLabel.Text = text end) end
+end
+
+local function doorsInstance()
+    if not doorsInstancing then
+        local okM, mod = withIdentity(2, function()
+            local m = clientModule("InstancingCmds", 10)
+            return m and require(m)
+        end)
+        if okM and type(mod) == "table" and type(mod.Get) == "function" then doorsInstancing = mod end
+    end
+    if not doorsInstancing then return nil end
+    local ok, inst = withIdentity(2, doorsInstancing.Get)
+    if ok and type(inst) == "table" then return inst end
     return nil
 end
 
-local function witchLearnedArgs(eggName)
-    local learned = C._witchLearned
-    if not learned then return nil end
-    local a = { n = learned.n }
-    for i = 1, learned.n do
-        a[i] = (learned[i] == learned.id) and eggName or learned[i]
-    end
-    return a
+local function doorsSaved(key)
+    local inst = doorsInstance()
+    if not (inst and type(inst.GetSavedValue) == "function") then return nil end
+    local ok, value = withIdentity(2, function() return inst:GetSavedValue(key) end)
+    if ok then return value end
+    return nil
 end
 
-local function witchBuildArgs(eggName)
-    local want = C.witchAmount
-    local max = witchMaxHatch()
-    if want and want > 0 then
-        if max and want > max then want = max end
-        local a = witchLearnedArgs(eggName)
-        if a and type(a[2]) == "number" then
-            a[2] = want
-            return a
+local function doorsUtil()
+    if doorsUtilMod then return doorsUtilMod end
+    local ok, mod = withIdentity(2, function() return require(RS.Library.Util.HatchWarDoors) end)
+    if ok and type(mod) == "table" then doorsUtilMod = mod end
+    return doorsUtilMod
+end
+
+local function doorsHousesFolder()
+    local root = getZoneRoot()
+    local zone = root and root:FindFirstChild(DOORS.ZoneName)
+    return zone and zone:FindFirstChild("Houses")
+end
+
+local function doorsUnlockedCount()
+    local houses = doorsSaved("Houses")
+    if type(houses) == "number" and houses == houses then
+        local util = doorsUtil()
+        if util and type(util.Unlocked) == "function" then
+            local ok, n = pcall(util.Unlocked, houses)
+            if ok and type(n) == "number" then return n end
         end
-        return table.pack(eggName, want)
+        return math.clamp(math.floor(houses), 1, DOORS.Houses)
     end
-    return witchLearnedArgs(eggName) or table.pack(eggName, max or 1)
+    if doorsInstance() then return 1 end
+    local folder = doorsHousesFolder()
+    if folder then
+        local n, sawLock = 0, false
+        for i = 1, DOORS.Houses do
+            local house = folder:FindFirstChild("House" .. i)
+            if not house then break end
+            if house:GetAttribute("HW_HouseLocked") == true then
+                sawLock = true
+                break
+            end
+            n = i
+        end
+        if sawLock and n > 0 then return n end
+    end
+    return 1
 end
 
-local startWitch, stopWitch
+local function doorsCooldownEnd(doorsTable, houseNumber)
+    local util = doorsUtil()
+    if util and type(util.CooldownEnd) == "function" then
+        local ok, t = pcall(util.CooldownEnd, doorsTable, houseNumber)
+        if ok and type(t) == "number" then return t end
+    end
+    if type(doorsTable) == "table" then
+        local t = tonumber(doorsTable[tostring(houseNumber)]) or tonumber(doorsTable[houseNumber])
+        if t then return t end
+    end
+    return 0
+end
 
-startWitch = function()
-    C._witchRun = (C._witchRun or 0) + 1
-    local myRun = C._witchRun
-    witchHatched = 0
-    installWitchLearn()
-    if WITCH.DisableAnimations then witchSetAnimations(true) end
-    witchSetStatus("Witching: starting...")
+local function doorsUnlockCost(houseNumber)
+    local util = doorsUtil()
+    if util and type(util.UnlockCost) == "function" then
+        local ok, cost = pcall(util.UnlockCost, houseNumber)
+        if ok and type(cost) == "number" then return cost end
+    end
+    return nil
+end
 
-    task.spawn(function()
-        local fails = 0
-        while alive() and C.witchHatch and C._witchRun == myRun do
-            local remote = witchGetRemote()
-            if not remote then
-                witchSetStatus("Witching: hatch remote not found")
-                task.wait(2)
-            else
-                local egg = witchFindEgg()
-                if not egg then
-                    witchSetStatus("Witching: egg not found - go near it")
-                    task.wait(1)
-                else
-                    if WITCH.HideEggModel then witchHideEgg(egg) end
+local function doorsLollipops()
+    local ok, count = withIdentity(2, function()
+        local save = require(RS.Library.Client.Save).Get()
+        local misc = save and save.Inventory and save.Inventory.Misc
+        if type(misc) ~= "table" then return nil end
+        local total = 0
+        for _, item in pairs(misc) do
+            if type(item) == "table" and item.id == "Hatch War Lollipop" then
+                total += tonumber(item._am) or 1
+            end
+        end
+        return total
+    end)
+    if ok and type(count) == "number" then return count end
+    return nil
+end
 
-                    local args = witchBuildArgs(egg.Name)
-                    local amount = type(args[2]) == "number" and args[2] or 1
-                    local ok, result = pcall(function()
-                        if remote:IsA("RemoteFunction") then
-                            return remote:InvokeServer(table.unpack(args, 1, args.n))
-                        end
-                        remote:FireServer(table.unpack(args, 1, args.n))
-                        return true
-                    end)
+local function doorsFighting()
+    local ok, fighting = withIdentity(2, function()
+        local m = clientModule("HatchWarCmds", 10)
+        local boss = m and require(m).Feature("Boss")
+        return boss and boss.IsFighting() == true
+    end)
+    return ok and fighting == true
+end
 
-                    if ok and result then
-                        fails = 0
-                        witchHatched += amount
-                        witchSetStatus(("Witching: x%d | hatched %d"):format(amount, witchHatched))
+local function doorsRemote()
+    local net = RS:FindFirstChild("Network")
+    return net and net:FindFirstChild("Instancing_InvokeCustomFromClient")
+end
+
+local function doorsInvoke(action, houseNumber)
+    local remote = doorsRemote()
+    if not remote then return false, "remote not found" end
+    local ok, a, b = pcall(function()
+        return remote:InvokeServer("HatchWar", "HW_Doors_" .. action, houseNumber)
+    end)
+    if not ok then return false, tostring(a) end
+    if a == true then return true, b end
+    if type(a) == "table" then return true, a end
+    if type(b) == "string" then return false, b end
+    if type(a) == "string" then return false, a end
+    return false, "refused"
+end
+
+local function doorsPart(houseNumber)
+    local root = getZoneRoot()
+    local interact = root and root:FindFirstChild("INTERACT")
+    local folder = interact and interact:FindFirstChild("Doors")
+    local part = folder and folder:FindFirstChild(tostring(houseNumber))
+    if part and part:IsA("BasePart") then return part end
+    return nil
+end
+
+local function doorsSpot(houseNumber)
+    local part = doorsPart(houseNumber)
+    if not part then return nil end
+    local front = (part.CFrame * CFrame.new(0, 0, -DOORS.StandBack)).Position
+    local back = (part.CFrame * CFrame.new(0, 0, DOORS.StandBack)).Position
+    local folder = doorsHousesFolder()
+    local house = folder and folder:FindFirstChild("House" .. houseNumber)
+    if house and house:IsA("PVInstance") then
+        local hp = house:GetPivot().Position
+        local df = Vector3.new(front.X - hp.X, 0, front.Z - hp.Z).Magnitude
+        local db = Vector3.new(back.X - hp.X, 0, back.Z - hp.Z).Magnitude
+        if db > df then front = back end
+    end
+    return Vector3.new(front.X, part.Position.Y, front.Z)
+end
+
+local function doorsTeleport(houseNumber)
+    local spot = doorsSpot(houseNumber)
+    local char = lp.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (spot and root and hum and hum.Health > 0) then return false end
+    doorsHoldUntil = os.clock() + DOORS.SettleTime + 1
+    C.orbTarget = nil
+    local rotation = root.CFrame - root.CFrame.Position
+    root.CFrame = CFrame.new(spot) * rotation
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return true
+end
+
+local hubReady = false
+
+task.spawn(function()
+    local nextTry, buyRetryAt, lastBuyErr, lastKnockErr = {}, 0, nil, nil
+    local lastBought, lastBoughtAt = 0, 0
+    while alive() and not hubReady do task.wait(0.1) end
+    while alive() do
+        if not (C.running and (C.autoKnock or C.autoBuyHouses)) then
+            if doorsStats.active then
+                doorsStats.active = false
+                doorsSetStatus("Doors: idle")
+            end
+            task.wait(0.5)
+        else
+            doorsStats.active = true
+            local ok, err = pcall(function()
+                if not getZoneRoot() then
+                    doorsSetStatus("Doors: waiting for HatchWar...")
+                    return
+                end
+
+                local unlocked = doorsUnlockedCount()
+                local clock = os.clock()
+
+                local fighting = doorsFighting()
+
+                local waitingForSave = lastBought > unlocked and os.clock() - lastBoughtAt < 15
+
+                if C.autoBuyHouses and unlocked < DOORS.Houses and clock >= buyRetryAt and not fighting and not waitingForSave then
+                    local target = unlocked + 1
+                    local cost = doorsUnlockCost(target)
+                    local lollipops = doorsLollipops()
+                    if cost and cost >= math.huge then
+                        buyRetryAt = clock + DOORS.BuyRetryAfter
+                        doorsStats.buy = ("house %d: not available yet"):format(target)
+                    elseif cost and lollipops == nil then
+                        buyRetryAt = clock + DOORS.BuyRetryAfter
+                        doorsStats.buy = ("house %d: lollipop count unavailable"):format(target)
+                    elseif cost and lollipops and lollipops < cost then
+                        buyRetryAt = clock + DOORS.BuyRetryAfter
+                        doorsStats.buy = ("house %d: need %s lollipops (have %s)"):format(target, fmtNum(cost), fmtNum(lollipops))
                     else
-                        fails += 1
-                        witchSetStatus("Witching: hatch failed (coins / amount / too far?)")
-                        if fails % 5 == 1 then log("Witching: hatch failed", tostring(result)) end
-                        task.wait(1)
+                        doorsSetStatus(("Doors: teleporting to locked house %d..."):format(target))
+                        if not doorsTeleport(target) then
+                            buyRetryAt = os.clock() + DOORS.RetryAfter
+                            doorsStats.buy = ("house %d: door or character not ready"):format(target)
+                        else
+                            task.wait(DOORS.SettleTime)
+                            if doorsFighting() then
+                                fighting = true
+                                buyRetryAt = os.clock() + 1
+                            else
+                                local okU, why = doorsInvoke("Unlock", target)
+                                if okU then
+                                    lastBought, lastBoughtAt = target, os.clock()
+                                    buyRetryAt = os.clock() + 2
+                                    doorsStats.buy = ("bought house %d"):format(target)
+                                    lastBuyErr = nil
+                                    log("Doors: unlocked house", target)
+                                else
+                                    buyRetryAt = os.clock() + DOORS.BuyRetryAfter
+                                    doorsStats.buy = ("house %d: %s"):format(target, tostring(why))
+                                    if why ~= lastBuyErr then
+                                        lastBuyErr = why
+                                        log("Doors: could not buy house", target, "-", why)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                elseif C.autoBuyHouses and waitingForSave then
+                    doorsStats.buy = ("waiting for house %d to register..."):format(lastBought)
+                elseif C.autoBuyHouses and unlocked >= DOORS.Houses then
+                    doorsStats.buy = "all houses owned"
+                end
+
+                local knockNote = ""
+                if C.autoKnock then
+                    if fighting then
+                        knockNote = " | waiting for the fight to end"
+                    else
+                        local doorsTable = doorsSaved("Doors")
+                        local now = workspace:GetServerTimeNow()
+                        local ready, soonest = nil, nil
+                        for i = 1, unlocked do
+                            local remaining = doorsCooldownEnd(doorsTable, i) - now
+                            if remaining <= 0 then
+                                if not ready and (nextTry[i] or 0) <= clock then ready = i end
+                            elseif not soonest or remaining < soonest then
+                                soonest = remaining
+                            end
+                        end
+
+                        if ready then
+                            doorsSetStatus(("Doors: teleporting to house %d..."):format(ready))
+                            if not doorsTeleport(ready) then
+                                nextTry[ready] = os.clock() + DOORS.RetryAfter
+                                doorsStats.last = ("house %d: door or character not ready"):format(ready)
+                            else
+                                task.wait(DOORS.SettleTime)
+                                if doorsFighting() then
+                                    nextTry[ready] = os.clock() + 1
+                                    knockNote = " | waiting for the fight to end"
+                                else
+                                    local okK, result = doorsInvoke("Knock", ready)
+                                    if okK then
+                                        doorsStats.knocks += 1
+                                        local prizes = type(result) == "table" and type(result.Rolls) == "table" and #result.Rolls or 0
+                                        doorsStats.prizes += prizes
+                                        local trick = type(result) == "table" and result.Result == "Trick"
+                                        local extra = trick and " + TRICK fight!" or ""
+                                        if trick then trickActiveUntil = os.clock() + 120 end
+                                        doorsStats.last = ("house %d: +%d prizes%s"):format(ready, prizes, extra)
+                                        nextTry[ready] = os.clock() + 3
+                                        lastKnockErr = nil
+                                        log("Doors: knocked house", ready, "-", prizes, "prizes" .. extra)
+                                    else
+                                        nextTry[ready] = os.clock() + DOORS.RetryAfter
+                                        doorsStats.last = ("house %d: %s"):format(ready, tostring(result))
+                                        if result ~= lastKnockErr then
+                                            lastKnockErr = result
+                                            log("Doors: knock on house", ready, "refused -", result)
+                                        end
+                                    end
+                                end
+                            end
+                        elseif soonest then
+                            knockNote = (" | next knock in %ds"):format(math.ceil(soonest))
+                        end
                     end
                 end
-            end
-            task.wait(WITCH.Delay)
-        end
-    end)
-end
 
-stopWitch = function()
-    C._witchRun = (C._witchRun or 0) + 1
-    witchRestoreEggs()
-    witchSetAnimations(false)
-    witchSetStatus("Witching: idle")
-end
+                local parts = { ("Doors: %d/%d houses"):format(unlocked, DOORS.Houses) }
+                if C.autoKnock then
+                    parts[#parts + 1] = ("knocks %d (%d prizes)"):format(doorsStats.knocks, doorsStats.prizes)
+                    if doorsStats.last ~= "" then parts[#parts + 1] = doorsStats.last end
+                end
+                if C.autoBuyHouses and doorsStats.buy ~= "" then parts[#parts + 1] = "buy: " .. doorsStats.buy end
+                doorsSetStatus(table.concat(parts, " | ") .. knockNote)
+            end)
+            if not ok then log("Doors error:", err) end
+            task.wait(DOORS.Tick)
+        end
+    end
+end)
 
 local function inst(cls, props, parent)
     local o = Instance.new(cls)
@@ -1922,19 +2401,19 @@ do
 end
 
 toggle("Orb Collector (hoverboard)", function() return C.orb end, function(v)
-    if v and C.autoBoss then
-        C.autoBoss = false
-        stopBoss()
+    if v then
+        if C.autoBoss then C.autoBoss = false; stopBoss() end
+        if C.manorHatch then C.manorHatch = false; stopManor() end
     end
     C.orb = v
     if v then startOrb() else stopOrb() end
 end)
-numRow("Orb Zone (1-4)", function() return C.orbZone end, function(v)
+numRow("Orb Zone (1-6)", function() return C.orbZone end, function(v)
     v = math.floor(v)
     if ORB_ZONES[v] then
         C.orbZone = v
     else
-        setStatus("invalid zone - enter 1, 2, 3 or 4")
+        setStatus("invalid zone - enter 1 to 6")
     end
 end)
 statusLabel = inst("TextLabel", {
@@ -1943,13 +2422,16 @@ statusLabel = inst("TextLabel", {
     TextTruncate = Enum.TextTruncate.AtEnd, Text = "Orb: idle",
 }, list)
 
-toggle("Auto Boss (teleport)", function() return C.autoBoss end, function(v)
-    if v and C.orb then
-        C.orb = false
-        stopOrb()
+toggle("Auto Boss 6 (teleport)", function() return C.autoBoss end, function(v)
+    if v then
+        if C.orb then C.orb = false; stopOrb() end
+        if C.manorHatch then C.manorHatch = false; stopManor() end
     end
     C.autoBoss = v
     if v then startBoss() else stopBoss() end
+end)
+numRow("Click Delay (s)", function() return C.bossClickDelay end, function(v)
+    C.bossClickDelay = math.clamp(tonumber(v) or C.bossClickDelay, 0, 3)
 end)
 bossLabel = inst("TextLabel", {
     LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
@@ -1960,23 +2442,36 @@ bossLabel = inst("TextLabel", {
 toggle("Break ALL event zones (no TP)", function() return C.breakAll end, function(v) C.breakAll = v end)
 numRow("Delay (s)", function() return C.breakAllDelay end, function(v) C.breakAllDelay = math.max(0.05, tonumber(v) or C.breakAllDelay) end)
 
-toggle("Auto Hatch Witching Egg", function() return C.witchHatch end, function(v)
-    C.witchHatch = v
-    if v then startWitch() else stopWitch() end
+toggle("Auto Hatch Manor Egg (TP)", function() return C.manorHatch end, function(v)
+    if v then
+        if C.orb then C.orb = false; stopOrb() end
+        if C.autoBoss then C.autoBoss = false; stopBoss() end
+    end
+    C.manorHatch = v
+    if v then startManor() else stopManor() end
 end)
-numRow("Hatch Amount (0=max)", function() return C.witchAmount end, function(v)
+numRow("Hatch Amount (0=max)", function() return C.manorAmount end, function(v)
     v = math.max(0, math.floor(v))
-    local max = witchMaxHatch()
+    local egg = getZoneRoot() and manorFindEgg() or nil
+    local max = manorMaxHatch(egg)
     if max and v > max then
         v = max
-        witchSetStatus(("Witching: capped to your max hatch (%d)"):format(max))
+        manorSetStatus(("Manor: capped to your max hatch (%d)"):format(max))
     end
-    C.witchAmount = v
+    C.manorAmount = v
 end)
-witchLabel = inst("TextLabel", {
+manorLabel = inst("TextLabel", {
     LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
     Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = MID, TextXAlignment = Enum.TextXAlignment.Left,
-    TextTruncate = Enum.TextTruncate.AtEnd, Text = "Witching: idle",
+    TextTruncate = Enum.TextTruncate.AtEnd, Text = "Manor: idle",
+}, list)
+
+toggle("Auto Knock Doors (TP, unlocked)", function() return C.autoKnock end, function(v) C.autoKnock = v end)
+toggle("Auto Buy Houses (TP, in order)", function() return C.autoBuyHouses end, function(v) C.autoBuyHouses = v end)
+doorsLabel = inst("TextLabel", {
+    LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = MID, TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd, Text = "Doors: idle",
 }, list)
 
 toggle("Auto Efficient Farm", function() return C.efficientFarm end, function(v)
@@ -2035,8 +2530,11 @@ do
                 petSpeed = C.petSpeed == true,
                 superMagnet = C.superMagnet == true,
                 antiAfk = C.antiAfk ~= false,
-                witchHatch = C.witchHatch == true,
-                witchAmount = C.witchAmount,
+                manorHatch = C.manorHatch == true,
+                manorAmount = C.manorAmount,
+                autoKnock = C.autoKnock == true,
+                autoBuyHouses = C.autoBuyHouses == true,
+                bossClickDelay = C.bossClickDelay,
                 whiteScreen = C.whiteScreen == true,
                 fpsCap = C.fpsCap,
             }))
@@ -2051,6 +2549,11 @@ do
     end)
 
     local cfg = readConfig()
+    local resumeManor = cfg ~= nil and cfg.manorHatch == true and cfg.orb ~= true and cfg.autoBoss ~= true
+    if not resumeManor then
+        manorRestoreEggs()
+        if C._eggAnimOrig ~= nil then manorSetAnimations(false) end
+    end
     if cfg then
         local zone = tonumber(cfg.orbZone)
         if zone and ORB_ZONES[math.floor(zone)] then C.orbZone = math.floor(zone) end
@@ -2062,22 +2565,26 @@ do
         if type(cfg.antiAfk) == "boolean" then C.antiAfk = cfg.antiAfk end
         if tonumber(cfg.fpsCap) then setFpsCap(cfg.fpsCap) end
         if type(cfg.whiteScreen) == "boolean" and cfg.whiteScreen ~= C.whiteScreen then setWhiteScreen(cfg.whiteScreen) end
-        local witchAmt = tonumber(cfg.witchAmount)
-        if witchAmt and witchAmt >= 0 then C.witchAmount = math.floor(witchAmt) end
-        if cfg.witchHatch == true then
-            C.witchHatch = true
-            startWitch()
-        end
+        local manorAmt = tonumber(cfg.manorAmount)
+        if manorAmt and manorAmt >= 0 then C.manorAmount = math.floor(manorAmt) end
+        if tonumber(cfg.bossClickDelay) then C.bossClickDelay = math.clamp(tonumber(cfg.bossClickDelay), 0, 3) end
+        if type(cfg.autoKnock) == "boolean" then C.autoKnock = cfg.autoKnock end
+        if type(cfg.autoBuyHouses) == "boolean" then C.autoBuyHouses = cfg.autoBuyHouses end
         if cfg.orb == true then
             C.orb = true
             startOrb()
         elseif cfg.autoBoss == true then
             C.autoBoss = true
             startBoss()
+        elseif cfg.manorHatch == true then
+            C.manorHatch = true
+            startManor()
         end
         for _, rf in ipairs(sync) do pcall(rf) end
     end
 end
+
+hubReady = true
 
 if C.petSpeed and not installPetSpeed() then C.petSpeed = false end
 if C.efficientFarm then
