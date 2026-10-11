@@ -319,6 +319,7 @@ C.manorHatch = false
 C.manorAmount = math.max(0, math.floor(tonumber(C.manorAmount) or 0))
 C.autoKnock = C.autoKnock == true
 C.autoBuyHouses = C.autoBuyHouses == true
+C.doorsMethod = C.doorsMethod == "Walk" and "Walk" or "Teleport"
 C.orbZone = math.floor(tonumber(C.orbZone) or 1)
 if C.orbZone < 1 or C.orbZone > 6 then C.orbZone = 1 end
 
@@ -341,8 +342,11 @@ end
 C._efConns = {}
 local function alive() return MY_RUN == C._runId end
 local function log(...) if C.verb then print("[VY]", ...) end end
-local doorsHoldUntil = 0 -- door teleport settle window, pauses the Orb / Boss / Manor movers
+local doorsHoldUntil = 0 -- door teleport / walk window, pauses the Orb / Boss / Manor movers
 local function doorsHolding() return os.clock() < doorsHoldUntil end
+local doorsPriorityUntil = 0 -- doors ready to open: Auto Boss / Manor pause until they are done
+local function doorsPriority() return os.clock() < doorsPriorityUntil end
+local doorsWalkTarget = nil -- hoverboard steering target while walking to a door
 
 C.antiAfk = C.antiAfk ~= false
 if C._afkConn then pcall(function() C._afkConn:Disconnect() end) end
@@ -871,7 +875,16 @@ local function installHoverboardSteering()
 
     pcall(function() if setreadonly then setreadonly(class, false) end end)
     local hook = function(self, ...)
-        if self._isLocal and doorsHolding() then return Vector3.zero end
+        if self._isLocal and doorsHolding() then
+            local walkTo = doorsWalkTarget
+            local hbRoot = self._humanoidRootPart
+            if walkTo and hbRoot then
+                local flatWalk = Vector3.new(walkTo.X - hbRoot.Position.X, 0, walkTo.Z - hbRoot.Position.Z)
+                local dist = flatWalk.Magnitude
+                if dist > 2 then return flatWalk.Unit * math.clamp(dist / 8, 0.35, 1) end
+            end
+            return Vector3.zero
+        end
         local target = C.orbTarget
         if target and C.orb and alive() and self._isLocal then
             local root = self._humanoidRootPart
@@ -1143,6 +1156,8 @@ local startBoss, stopBoss
 local bossLabel
 local trickActiveUntil = 0
 local function trickTapping() return os.clock() < trickActiveUntil end
+local trickWaitUntil, trickSeenFight = 0, false
+local bossScanCircles
 
 do
     local BOSS_ZONE = 6
@@ -1228,11 +1243,16 @@ do
             if d.Name == CIRCLE_NAME then track(d) end
         end
     end
+    bossScanCircles = scanCircles
+
+    local function circlesWanted()
+        return C.autoBoss or C.autoKnock or trickTapping()
+    end
 
     local playerGui = lp:FindFirstChild("PlayerGui")
     if playerGui then
         table.insert(C._efConns, playerGui.DescendantAdded:Connect(function(d)
-            if (C.autoBoss or trickTapping()) and d.Name == CIRCLE_NAME then track(d) end
+            if circlesWanted() and d.Name == CIRCLE_NAME then track(d) end
         end))
     end
 
@@ -1387,7 +1407,7 @@ do
     task.spawn(function()
         local lastTap = -math.huge
         while alive() do
-            if not (C.running and (C.autoBoss or trickTapping())) then
+            if not (C.running and circlesWanted()) then
                 task.wait(0.2)
             else
                 task.wait()
@@ -1501,6 +1521,11 @@ do
 
                     local now = os.clock()
 
+                    if doorsPriority() then
+                        setBossState(fightActive(now) and "fighting (doors next)" or "paused - opening doors")
+                        return
+                    end
+
                     if now - lastTeleport >= TELEPORT_EVERY and not doorsHolding() then
                         lastTeleport = now
                         teleportToBoss(root)
@@ -1533,8 +1558,8 @@ do
             if bossLabel then
                 if C.autoBoss then
                     bossLabel.Text = ("Boss: %s | hit %d | lost %d | taps %d"):format(bossState, stats.hit, stats.lost, stats.taps)
-                elseif trickTapping() then
-                    bossLabel.Text = ("Boss: tapping Trick fight circles | hit %d | taps %d"):format(stats.hit, stats.taps)
+                elseif (C.autoKnock or trickTapping()) and os.clock() - lastCircleAt < FIGHT_IDLE then
+                    bossLabel.Text = ("Boss: tapping door fight circles | hit %d | taps %d"):format(stats.hit, stats.taps)
                 else
                     bossLabel.Text = "Boss: idle"
                 end
@@ -1552,7 +1577,7 @@ do
 
     stopBoss = function()
         table.clear(circles)
-        if trickTapping() then scanCircles() end
+        if C.autoKnock or trickTapping() then scanCircles() end
     end
 end
 
@@ -1835,6 +1860,19 @@ startManor = function()
                     return
                 end
 
+                if doorsPriority() then
+                    manorSetStatus(("Manor: paused - opening doors | hatched %d"):format(manorHatched))
+                    needTeleport = true
+                    waitFor = 0.5
+                    return
+                end
+
+                if needTeleport and doorsHolding() then
+                    manorSetStatus(("Manor: paused - opening doors | hatched %d"):format(manorHatched))
+                    waitFor = 0.25
+                    return
+                end
+
                 if needTeleport then
                     manorSetStatus("Manor: teleporting to the egg...")
                     if manorTeleport() then
@@ -1941,6 +1979,8 @@ local DOORS = {
     BuyRetryAfter = 10,
     StandBack = 4,
     SettleTime = 0.4,
+    ArriveRadius = 3,
+    WalkTimeout = 45,
 }
 
 local doorsLabel
@@ -2054,6 +2094,9 @@ local function doorsLollipops()
 end
 
 local function doorsFighting()
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:FindFirstChild("HW_BossHoldPosition") then return true end -- still locked in the fight arena
     local ok, fighting = withIdentity(2, function()
         local m = clientModule("HatchWarCmds", 10)
         local boss = m and require(m).Feature("Boss")
@@ -2123,14 +2166,122 @@ local function doorsTeleport(houseNumber)
     return true
 end
 
+local function doorsWalkTo(spot, keepGoing)
+    local char = lp.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not (spot and hum and root and hum.Health > 0) then return false, "character not ready" end
+
+    local function flatTo(p)
+        local r = root.Position
+        return Vector3.new(p.X - r.X, 0, p.Z - r.Z).Magnitude
+    end
+    if flatTo(spot) <= DOORS.ArriveRadius then
+        doorsHoldUntil = os.clock() + DOORS.SettleTime + 1
+        return true
+    end
+
+    C.orbTarget = nil
+    doorsHoldUntil = os.clock() + 1.5
+    doorsPriorityUntil = math.max(doorsPriorityUntil, os.clock() + DOORS.Tick + 2.5)
+    if hoverboardOn() then
+        local okHook, hooked = pcall(installHoverboardSteering)
+        if not (okHook and hooked) then
+            -- the board ignores MoveTo without the steering hook, so get off it and walk
+            fireNetwork("Hoverboard_RequestUnequip")
+            local t = os.clock()
+            while hoverboardOn() and os.clock() - t < 3 do
+                doorsHoldUntil = os.clock() + 1.5
+                task.wait(0.1)
+            end
+        end
+    end
+
+    local waypoints
+    local okP, path = pcall(function()
+        local p = game:GetService("PathfindingService"):CreatePath({
+            AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 8,
+        })
+        p:ComputeAsync(root.Position, spot)
+        return p
+    end)
+    if okP and path and path.Status == Enum.PathStatus.Success then
+        local okW, wps = pcall(function() return path:GetWaypoints() end)
+        if okW and type(wps) == "table" and #wps > 0 then waypoints = wps end
+    end
+    if not waypoints then
+        waypoints = { { Position = spot, Action = Enum.PathWaypointAction.Walk } }
+    end
+
+    local deadline = os.clock() + DOORS.WalkTimeout
+    local stuck, okWalk, why = 0, true, nil
+    for index = (#waypoints > 1 and 2 or 1), #waypoints do
+        local wp = waypoints[index]
+        local target = wp.Position
+        local reach = index == #waypoints and DOORS.ArriveRadius or 4
+        local best, progressAt = math.huge, os.clock()
+        if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+        while true do
+            if not keepGoing() then okWalk, why = false, "stopped"; break end
+            if not (hum.Parent and root.Parent and hum.Health > 0) then okWalk, why = false, "character died"; break end
+            if os.clock() > deadline then okWalk, why = false, "walk timed out"; break end
+            if doorsFighting() then okWalk, why = false, "a fight started"; break end
+            doorsHoldUntil = os.clock() + 1.5
+            doorsPriorityUntil = math.max(doorsPriorityUntil, os.clock() + DOORS.Tick + 2.5)
+            doorsWalkTarget = target
+            hum:MoveTo(target)
+            task.wait(0.1)
+            local d = flatTo(target)
+            if d <= reach then break end
+            if d < best - 0.5 then
+                best, progressAt = d, os.clock()
+                stuck = 0
+            elseif os.clock() - progressAt > 1.5 then
+                hum.Jump = true
+                progressAt = os.clock()
+                stuck += 1
+                if stuck >= 4 then okWalk, why = false, "stuck on the way"; break end
+            end
+        end
+        if not okWalk then break end
+    end
+
+    doorsWalkTarget = nil
+    pcall(function() hum:MoveTo(root.Position) end)
+    if okWalk and flatTo(spot) > DOORS.ArriveRadius + 2 then okWalk, why = false, "did not reach the door" end
+    if okWalk then doorsHoldUntil = os.clock() + DOORS.SettleTime + 1 end
+    return okWalk, why
+end
+
+local function doorsGoTo(houseNumber, keepGoing)
+    if C.doorsMethod == "Walk" then
+        local spot = doorsSpot(houseNumber)
+        if not spot then return false, "door not found" end
+        return doorsWalkTo(spot, keepGoing)
+    end
+    if doorsTeleport(houseNumber) then return true end
+    return false, "door or character not ready"
+end
+
 local hubReady = false
 
 task.spawn(function()
-    local nextTry, buyRetryAt, lastBuyErr, lastKnockErr = {}, 0, nil, nil
+    local nextTry, knockFails, buyRetryAt, buyFails = {}, {}, 0, 0
+    local knockGlobalFails, knockGlobalRetryAt = 0, 0
+    local lastBuyErr, lastKnockErr = nil, nil
     local lastBought, lastBoughtAt = 0, 0
+    local function keepKnocking() return alive() and C.running and C.autoKnock end
+    local function keepBuying() return alive() and C.running and C.autoBuyHouses end
+    local function backoff(base, fails, cap) return math.min(base * 2 ^ math.max(fails - 1, 0), cap) end
     while alive() and not hubReady do task.wait(0.1) end
     while alive() do
         if not (C.running and (C.autoKnock or C.autoBuyHouses)) then
+            if trickTapping() and doorsFighting() then
+                doorsPriorityUntil = os.clock() + DOORS.Tick + 2.5 -- never pull the player out of a running Trick fight
+            else
+                doorsPriorityUntil = 0
+                trickActiveUntil, trickSeenFight = 0, false
+            end
             if doorsStats.active then
                 doorsStats.active = false
                 doorsSetStatus("Doors: idle")
@@ -2140,119 +2291,178 @@ task.spawn(function()
             doorsStats.active = true
             local ok, err = pcall(function()
                 if not getZoneRoot() then
+                    doorsPriorityUntil = 0
                     doorsSetStatus("Doors: waiting for HatchWar...")
                     return
                 end
 
                 local unlocked = doorsUnlockedCount()
                 local clock = os.clock()
-
                 local fighting = doorsFighting()
+                local verb = C.doorsMethod == "Walk" and "walking" or "teleporting"
 
-                local waitingForSave = lastBought > unlocked and os.clock() - lastBoughtAt < 15
-
-                if C.autoBuyHouses and unlocked < DOORS.Houses and clock >= buyRetryAt and not fighting and not waitingForSave then
-                    local target = unlocked + 1
-                    local cost = doorsUnlockCost(target)
-                    local lollipops = doorsLollipops()
-                    if cost and cost >= math.huge then
-                        buyRetryAt = clock + DOORS.BuyRetryAfter
-                        doorsStats.buy = ("house %d: not available yet"):format(target)
-                    elseif cost and lollipops == nil then
-                        buyRetryAt = clock + DOORS.BuyRetryAfter
-                        doorsStats.buy = ("house %d: lollipop count unavailable"):format(target)
-                    elseif cost and lollipops and lollipops < cost then
-                        buyRetryAt = clock + DOORS.BuyRetryAfter
-                        doorsStats.buy = ("house %d: need %s lollipops (have %s)"):format(target, fmtNum(cost), fmtNum(lollipops))
-                    else
-                        doorsSetStatus(("Doors: teleporting to locked house %d..."):format(target))
-                        if not doorsTeleport(target) then
-                            buyRetryAt = os.clock() + DOORS.RetryAfter
-                            doorsStats.buy = ("house %d: door or character not ready"):format(target)
-                        else
-                            task.wait(DOORS.SettleTime)
-                            if doorsFighting() then
-                                fighting = true
-                                buyRetryAt = os.clock() + 1
-                            else
-                                local okU, why = doorsInvoke("Unlock", target)
-                                if okU then
-                                    lastBought, lastBoughtAt = target, os.clock()
-                                    buyRetryAt = os.clock() + 2
-                                    doorsStats.buy = ("bought house %d"):format(target)
-                                    lastBuyErr = nil
-                                    log("Doors: unlocked house", target)
-                                else
-                                    buyRetryAt = os.clock() + DOORS.BuyRetryAfter
-                                    doorsStats.buy = ("house %d: %s"):format(target, tostring(why))
-                                    if why ~= lastBuyErr then
-                                        lastBuyErr = why
-                                        log("Doors: could not buy house", target, "-", why)
-                                    end
-                                end
-                            end
-                        end
+                if trickTapping() then
+                    if fighting then
+                        trickSeenFight = true
+                    elseif trickSeenFight or clock > trickWaitUntil then
+                        trickActiveUntil, trickSeenFight = 0, false
                     end
-                elseif C.autoBuyHouses and waitingForSave then
-                    doorsStats.buy = ("waiting for house %d to register..."):format(lastBought)
-                elseif C.autoBuyHouses and unlocked >= DOORS.Houses then
-                    doorsStats.buy = "all houses owned"
                 end
 
-                local knockNote = ""
-                if C.autoKnock then
-                    if fighting then
-                        knockNote = " | waiting for the fight to end"
-                    else
-                        local doorsTable = doorsSaved("Doors")
-                        local now = workspace:GetServerTimeNow()
-                        local ready, soonest = nil, nil
-                        for i = 1, unlocked do
-                            local remaining = doorsCooldownEnd(doorsTable, i) - now
-                            if remaining <= 0 then
-                                if not ready and (nextTry[i] or 0) <= clock then ready = i end
-                            elseif not soonest or remaining < soonest then
-                                soonest = remaining
-                            end
-                        end
-
-                        if ready then
-                            doorsSetStatus(("Doors: teleporting to house %d..."):format(ready))
-                            if not doorsTeleport(ready) then
-                                nextTry[ready] = os.clock() + DOORS.RetryAfter
-                                doorsStats.last = ("house %d: door or character not ready"):format(ready)
-                            else
-                                task.wait(DOORS.SettleTime)
-                                if doorsFighting() then
-                                    nextTry[ready] = os.clock() + 1
-                                    knockNote = " | waiting for the fight to end"
-                                else
-                                    local okK, result = doorsInvoke("Knock", ready)
-                                    if okK then
-                                        doorsStats.knocks += 1
-                                        local prizes = type(result) == "table" and type(result.Rolls) == "table" and #result.Rolls or 0
-                                        doorsStats.prizes += prizes
-                                        local trick = type(result) == "table" and result.Result == "Trick"
-                                        local extra = trick and " + TRICK fight!" or ""
-                                        if trick then trickActiveUntil = os.clock() + 120 end
-                                        doorsStats.last = ("house %d: +%d prizes%s"):format(ready, prizes, extra)
-                                        nextTry[ready] = os.clock() + 3
-                                        lastKnockErr = nil
-                                        log("Doors: knocked house", ready, "-", prizes, "prizes" .. extra)
-                                    else
-                                        nextTry[ready] = os.clock() + DOORS.RetryAfter
-                                        doorsStats.last = ("house %d: %s"):format(ready, tostring(result))
-                                        if result ~= lastKnockErr then
-                                            lastKnockErr = result
-                                            log("Doors: knock on house", ready, "refused -", result)
-                                        end
-                                    end
-                                end
-                            end
-                        elseif soonest then
-                            knockNote = (" | next knock in %ds"):format(math.ceil(soonest))
+                local buyTarget = nil
+                if C.autoBuyHouses then
+                    local waitingForSave = lastBought > unlocked and clock - lastBoughtAt < 15
+                    if unlocked >= DOORS.Houses then
+                        doorsStats.buy = "all houses owned"
+                    elseif waitingForSave then
+                        doorsStats.buy = ("waiting for house %d to register..."):format(lastBought)
+                    elseif clock >= buyRetryAt then
+                        local target = unlocked + 1
+                        local cost = doorsUnlockCost(target)
+                        local lollipops = doorsLollipops()
+                        if cost and cost >= math.huge then
+                            buyRetryAt = clock + DOORS.BuyRetryAfter
+                            doorsStats.buy = ("house %d: not available yet"):format(target)
+                        elseif cost and lollipops == nil then
+                            buyRetryAt = clock + DOORS.BuyRetryAfter
+                            doorsStats.buy = ("house %d: lollipop count unavailable"):format(target)
+                        elseif cost and lollipops < cost then
+                            buyRetryAt = clock + DOORS.BuyRetryAfter
+                            doorsStats.buy = ("house %d: need %s lollipops (have %s)"):format(target, fmtNum(cost), fmtNum(lollipops))
+                        else
+                            buyTarget = target
                         end
                     end
+                end
+
+                local knockReady, soonest = {}, nil
+                local knocksPaused = C.autoKnock and clock < knockGlobalRetryAt
+                if C.autoKnock and not knocksPaused then
+                    local doorsTable = doorsSaved("Doors")
+                    local now = workspace:GetServerTimeNow()
+                    for i = 1, unlocked do
+                        local remaining = doorsCooldownEnd(doorsTable, i) - now
+                        if remaining <= 0 then
+                            if (nextTry[i] or 0) <= clock then knockReady[#knockReady + 1] = i end
+                        elseif not soonest or remaining < soonest then
+                            soonest = remaining
+                        end
+                    end
+                end
+
+                local pending = buyTarget ~= nil or #knockReady > 0
+                if pending or trickTapping() then
+                    doorsPriorityUntil = os.clock() + DOORS.Tick + 2.5
+                else
+                    doorsPriorityUntil = 0
+                end
+
+                local trickStarting = trickTapping() and not trickSeenFight and clock <= trickWaitUntil
+                local knockNote = ""
+                if knocksPaused then
+                    knockNote = (" | knocks paused %ds (refused)"):format(math.ceil(knockGlobalRetryAt - clock))
+                end
+                if fighting or trickStarting then
+                    if pending or trickTapping() then knockNote = " | waiting for the fight to end" end
+                elseif buyTarget then
+                    doorsSetStatus(("Doors: %s to locked house %d..."):format(verb, buyTarget))
+                    local moved, why = doorsGoTo(buyTarget, keepBuying)
+                    if not moved then
+                        buyFails += 1
+                        buyRetryAt = os.clock() + backoff(DOORS.RetryAfter, buyFails, 120)
+                        doorsStats.buy = ("house %d: %s"):format(buyTarget, tostring(why or "could not reach the door"))
+                    else
+                        task.wait(DOORS.SettleTime)
+                        if doorsFighting() then
+                            buyRetryAt = os.clock() + 1
+                        elseif not keepBuying() then
+                            buyRetryAt = os.clock() + 1
+                        else
+                            local okU, why2 = doorsInvoke("Unlock", buyTarget)
+                            if okU then
+                                buyFails = 0
+                                lastBought, lastBoughtAt = buyTarget, os.clock()
+                                buyRetryAt = os.clock() + 2
+                                doorsStats.buy = ("bought house %d"):format(buyTarget)
+                                lastBuyErr = nil
+                                log("Doors: unlocked house", buyTarget)
+                            else
+                                buyFails += 1
+                                buyRetryAt = os.clock() + backoff(DOORS.BuyRetryAfter, buyFails, 300)
+                                doorsStats.buy = ("house %d: %s"):format(buyTarget, tostring(why2))
+                                if why2 ~= lastBuyErr then
+                                    lastBuyErr = why2
+                                    log("Doors: could not buy house", buyTarget, "-", why2)
+                                end
+                            end
+                        end
+                    end
+                elseif #knockReady > 0 then
+                    local ready = knockReady[1]
+                    local char = lp.Character
+                    local root = char and char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        local bestD = math.huge
+                        for _, i in ipairs(knockReady) do
+                            local spot = doorsSpot(i)
+                            if spot then
+                                local d = (spot - root.Position).Magnitude
+                                if d < bestD then ready, bestD = i, d end
+                            end
+                        end
+                    end
+
+                    doorsSetStatus(("Doors: %s to house %d..."):format(verb, ready))
+                    local moved, why = doorsGoTo(ready, keepKnocking)
+                    if not moved then
+                        knockFails[ready] = (knockFails[ready] or 0) + 1
+                        nextTry[ready] = os.clock() + backoff(DOORS.RetryAfter, knockFails[ready], 120)
+                        doorsStats.last = ("house %d: %s"):format(ready, tostring(why or "could not reach the door"))
+                    else
+                        task.wait(DOORS.SettleTime)
+                        if doorsFighting() then
+                            nextTry[ready] = os.clock() + 1
+                            knockNote = " | waiting for the fight to end"
+                        elseif not keepKnocking() then
+                            nextTry[ready] = os.clock() + 1
+                        else
+                            local okK, result = doorsInvoke("Knock", ready)
+                            if okK then
+                                knockFails[ready] = 0
+                                knockGlobalFails = 0
+                                doorsStats.knocks += 1
+                                local prizes = type(result) == "table" and type(result.Rolls) == "table" and #result.Rolls or 0
+                                doorsStats.prizes += prizes
+                                local trick = type(result) == "table" and result.Result == "Trick"
+                                local extra = trick and " + TRICK fight!" or ""
+                                if trick then
+                                    trickActiveUntil = os.clock() + 120
+                                    trickWaitUntil = os.clock() + 10
+                                    trickSeenFight = false
+                                    doorsPriorityUntil = os.clock() + DOORS.Tick + 2.5
+                                    if bossScanCircles then pcall(bossScanCircles) end
+                                end
+                                doorsStats.last = ("house %d: +%d prizes%s"):format(ready, prizes, extra)
+                                nextTry[ready] = os.clock() + 3
+                                lastKnockErr = nil
+                                log("Doors: knocked house", ready, "-", prizes, "prizes" .. extra)
+                            else
+                                knockFails[ready] = (knockFails[ready] or 0) + 1
+                                nextTry[ready] = os.clock() + backoff(DOORS.RetryAfter, knockFails[ready], 120)
+                                knockGlobalFails += 1
+                                if knockGlobalFails >= 3 then
+                                    knockGlobalRetryAt = os.clock() + backoff(15, knockGlobalFails - 2, 300)
+                                end
+                                doorsStats.last = ("house %d: %s"):format(ready, tostring(result))
+                                if result ~= lastKnockErr then
+                                    lastKnockErr = result
+                                    log("Doors: knock on house", ready, "refused -", result)
+                                end
+                            end
+                        end
+                    end
+                elseif soonest then
+                    knockNote = (" | next knock in %ds"):format(math.ceil(soonest))
                 end
 
                 local parts = { ("Doors: %d/%d houses"):format(unlocked, DOORS.Houses) }
@@ -2261,6 +2471,11 @@ task.spawn(function()
                     if doorsStats.last ~= "" then parts[#parts + 1] = doorsStats.last end
                 end
                 if C.autoBuyHouses and doorsStats.buy ~= "" then parts[#parts + 1] = "buy: " .. doorsStats.buy end
+                if pending or trickTapping() then
+                    -- keep Boss / Manor paused until the next tick re-checks what is still ready
+                    doorsPriorityUntil = math.max(doorsPriorityUntil, os.clock() + DOORS.Tick + 2.5)
+                end
+                if doorsPriority() and (C.autoBoss or C.manorHatch) then parts[#parts + 1] = "Boss/Manor paused" end
                 doorsSetStatus(table.concat(parts, " | ") .. knockNote)
             end)
             if not ok then log("Doors error:", err) end
@@ -2336,6 +2551,18 @@ local function numRow(title, get, set)
         tb.Text = tostring(get())
     end)
     table.insert(sync, function() if not tb:IsFocused() then tb.Text = tostring(get()) end end)
+end
+local function choiceRow(title, options, get, set)
+    local f = inst("Frame", { LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = EL, BackgroundTransparency = 0.35, BorderSizePixel = 0 }, list); corner(10, f); stroke(1, LINE, f)
+    inst("TextLabel", { BackgroundTransparency = 1, Size = UDim2.new(0.5, -8, 1, 0), Position = UDim2.new(0, 12, 0, 0), Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = TXT, TextXAlignment = Enum.TextXAlignment.Left, Text = title }, f)
+    local b = inst("TextButton", { Size = UDim2.new(0.42, -10, 0, 26), Position = UDim2.new(0.54, 0, 0.5, -13), BackgroundColor3 = Color3.fromRGB(30, 30, 30), BackgroundTransparency = 0.3, Text = tostring(get()), TextColor3 = TXT, Font = Enum.Font.GothamBold, TextSize = 13, BorderSizePixel = 0, AutoButtonColor = false }, f); corner(8, b); stroke(1, LINE, b)
+    local function rf() pcall(function() b.Text = tostring(get()) end) end
+    b.MouseButton1Click:Connect(function()
+        local idx = table.find(options, get()) or 0
+        set(options[idx % #options + 1])
+        rf()
+    end)
+    table.insert(sync, rf)
 end
 
 local setWhiteScreen, setFpsCap
@@ -2466,8 +2693,14 @@ manorLabel = inst("TextLabel", {
     TextTruncate = Enum.TextTruncate.AtEnd, Text = "Manor: idle",
 }, list)
 
-toggle("Auto Knock Doors (TP, unlocked)", function() return C.autoKnock end, function(v) C.autoKnock = v end)
-toggle("Auto Buy Houses (TP, in order)", function() return C.autoBuyHouses end, function(v) C.autoBuyHouses = v end)
+toggle("Auto Knock Doors (unlocked)", function() return C.autoKnock end, function(v)
+    C.autoKnock = v
+    if v and bossScanCircles then pcall(bossScanCircles) end
+end)
+toggle("Auto Buy Houses (in order)", function() return C.autoBuyHouses end, function(v) C.autoBuyHouses = v end)
+choiceRow("Door Move Method", { "Teleport", "Walk" }, function() return C.doorsMethod end, function(v)
+    C.doorsMethod = v == "Walk" and "Walk" or "Teleport"
+end)
 doorsLabel = inst("TextLabel", {
     LayoutOrder = nextOrder(), Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
     Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = MID, TextXAlignment = Enum.TextXAlignment.Left,
@@ -2534,6 +2767,7 @@ do
                 manorAmount = C.manorAmount,
                 autoKnock = C.autoKnock == true,
                 autoBuyHouses = C.autoBuyHouses == true,
+                doorsMethod = C.doorsMethod,
                 bossClickDelay = C.bossClickDelay,
                 whiteScreen = C.whiteScreen == true,
                 fpsCap = C.fpsCap,
@@ -2570,6 +2804,7 @@ do
         if tonumber(cfg.bossClickDelay) then C.bossClickDelay = math.clamp(tonumber(cfg.bossClickDelay), 0, 3) end
         if type(cfg.autoKnock) == "boolean" then C.autoKnock = cfg.autoKnock end
         if type(cfg.autoBuyHouses) == "boolean" then C.autoBuyHouses = cfg.autoBuyHouses end
+        if cfg.doorsMethod == "Walk" or cfg.doorsMethod == "Teleport" then C.doorsMethod = cfg.doorsMethod end
         if cfg.orb == true then
             C.orb = true
             startOrb()
